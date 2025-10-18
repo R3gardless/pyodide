@@ -1,4 +1,4 @@
-.PHONY: pyodide-build
+.PHONY: pyodide-build clean
 
 export PYODIDE_ROOT=$(abspath ..)
 include ../Makefile.envs

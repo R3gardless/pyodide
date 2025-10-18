@@ -2,7 +2,11 @@ PYODIDE_ROOT=$(abspath .)
 
 include Makefile.envs
 
-.PHONY: check
+# phony targets for checking
+.PHONY: check check-emcc
+
+# phony targets for cleaning
+.PHONY: clean clean-python clean-all
 
 CC=emcc
 CXX=em++

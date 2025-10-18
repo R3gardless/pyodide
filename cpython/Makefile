@@ -69,7 +69,7 @@ rebuild-all:
 	touch $(PYBUILD)/Include/abstract.h
 	make rebuild
 
-
+.PHONY: clean clean-all
 clean:
 	-rm -fr $(ROOT)/build
 	-rm -fr $(ROOT)/installs
