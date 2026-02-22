@@ -546,7 +546,7 @@ export class PyodideAPI_ {
   static async mountNativeFS(
     path: string,
     fileSystemHandle: FileSystemDirectoryHandle,
-    // TODO: support sync file system
+    // TODO: support sync file system -- see mountOPFS for sync I/O via SyncAccessHandle
     // sync: boolean = false
   ): Promise<NativeFS> {
     if (fileSystemHandle.constructor.name !== "FileSystemDirectoryHandle") {
@@ -568,6 +568,68 @@ export class PyodideAPI_ {
     return {
       // sync browser ==> native
       syncfs: async () => await syncLocalToRemote(Module),
+    };
+  }
+
+  /**
+   * Mounts an OPFS (Origin Private File System) directory into the Pyodide
+   * file system using synchronous ``FileSystemSyncAccessHandle`` for direct
+   * I/O, bypassing MEMFS for file data entirely. This avoids the memory
+   * doubling problem of :js:func:`~pyodide.mountNativeFS`.
+   *
+   * Reads and writes to existing files are synchronous and go directly to
+   * OPFS. New files created from Python are buffered in MEMFS until
+   * ``syncfs()`` is called.
+   *
+   * Only works with OPFS directory handles (from
+   * :js:func:`navigator.storage.getDirectory()`), not with handles from
+   * ``showDirectoryPicker()``.
+   *
+   * @param path The absolute path in the Emscripten file system to mount the
+   * OPFS directory. If the directory does not exist, it will be created. If
+   * it does exist, it must be empty.
+   * @param dirHandle A handle returned by
+   * :js:func:`navigator.storage.getDirectory() <getDirectory>` or a
+   * subdirectory thereof. If not provided, defaults to the OPFS root.
+   */
+  static async mountOPFS(
+    path: string,
+    dirHandle?: FileSystemDirectoryHandle,
+  ): Promise<NativeFS> {
+    if (RUNTIME_ENV.IN_NODE) {
+      throw new Error("mountOPFS is not available in Node.js");
+    }
+    dirHandle ??= await navigator.storage.getDirectory();
+    if (dirHandle.constructor.name !== "FileSystemDirectoryHandle") {
+      throw new TypeError(
+        `Expected argument 'dirHandle' to be a FileSystemDirectoryHandle`,
+      );
+    }
+    ensureMountPathExists(path);
+
+    Module.FS.mount(
+      Module.FS.filesystems.OPFS_WORKER,
+      { fileSystemHandle: dirHandle },
+      path,
+    );
+
+    // Populate: walk OPFS tree, create MEMFS structure, open SyncAccessHandles
+    await new Promise<void>((resolve, reject) => {
+      Module.FS.syncfs(true, (err: any) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    return {
+      syncfs: async () => {
+        await new Promise<void>((resolve, reject) => {
+          Module.FS.syncfs(false, (err: any) => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+      },
     };
   }
 
