@@ -122,3 +122,84 @@ or
 ```js
 pyodide.FS.syncfs(false, callback_func);
 ```
+
+(opfs-api)=
+
+# (Experimental) Using OPFS with synchronous I/O
+
+The {js:func}`pyodide.mountNativeFS` API copies all file contents from the native file
+system into MEMFS at mount time, doubling memory usage. For large files or
+data-heavy workflows, this can be a problem.
+
+{js:func}`pyodide.mountOPFS` provides an alternative that uses the
+[Origin Private File System](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API/Origin_private_file_system)
+with `FileSystemSyncAccessHandle` for direct synchronous I/O. File data is
+read from and written to OPFS directly -- no copy into MEMFS is needed.
+
+```{admonition} This is experimental
+:class: warning
+
+`mountOPFS` requires browser support for the Origin Private File System and
+`FileSystemSyncAccessHandle`. It works on Chrome 121+, Edge 121+, Firefox
+111+ (Web Worker only), and Safari 17.4+.
+```
+
+## Mounting an OPFS directory
+
+```pyodide
+// Mount the OPFS root
+const opfs = await pyodide.mountOPFS("/mnt/opfs");
+
+// Or mount a subdirectory
+const root = await navigator.storage.getDirectory();
+const subdir = await root.getDirectoryHandle("mydata", { create: true });
+const opfs = await pyodide.mountOPFS("/mnt/opfs", subdir);
+
+pyodide.runPython(`
+  import os
+  print(os.listdir('/mnt/opfs'))
+`);
+```
+
+## Reading and writing files
+
+Reads and writes to **existing** files go directly through `FileSystemSyncAccessHandle`
+and are immediately persisted to OPFS. No `syncfs()` call is needed for these operations.
+
+```pyodide
+pyodide.runPython(`
+  # Reading an existing file -- data comes directly from OPFS
+  with open('/mnt/opfs/data.csv') as f:
+    content = f.read()
+
+  # Writing to an existing file -- data goes directly to OPFS
+  with open('/mnt/opfs/data.csv', 'w') as f:
+    f.write("updated content")
+`);
+```
+
+## Creating new files
+
+New files created from Python are initially buffered in MEMFS. Call `syncfs()` to
+persist them to OPFS:
+
+```pyodide
+pyodide.runPython(`
+  with open('/mnt/opfs/new_file.txt', 'w') as f:
+    f.write("hello");
+`);
+
+// new_file.txt exists in MEMFS but not yet in OPFS
+await opfs.syncfs();
+// new_file.txt is now persisted in OPFS
+```
+
+## Comparison with mountNativeFS
+
+| Feature | `mountNativeFS` | `mountOPFS` |
+|---------|----------------|-------------|
+| Memory usage | Copies all file data into MEMFS (2x memory) | File data stays in OPFS (no copy) |
+| File sources | OPFS or `showDirectoryPicker()` handles | OPFS only (`navigator.storage.getDirectory()`) |
+| Read/write existing files | Through MEMFS copy | Direct synchronous I/O via `SyncAccessHandle` |
+| New file creation | Through MEMFS, needs `syncfs()` | Through MEMFS, needs `syncfs()` |
+| Best for | Small files, broad browser support | Large files, memory-constrained workflows |
