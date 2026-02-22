@@ -263,7 +263,7 @@ export function initializeNativeFS(module: PyodideModule) {
   module.FS.filesystems.NATIVEFS_ASYNC = nativeFSAsync;
 }
 
-const getFsHandles = async (dirHandle: any) => {
+export const getFsHandles = async (dirHandle: any) => {
   const handles: any = [];
 
   async function collect(curDirHandle: any) {

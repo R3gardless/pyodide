@@ -257,6 +257,393 @@ def test_nativefs_dir(request, selenium_standalone):
     )
 
 
+@pytest.mark.requires_dynamic_linking
+@only_chrome
+def test_opfs_worker_read(request, selenium_standalone):
+    """Create file in OPFS via JS, mount with mountOPFS, read from Python"""
+    if request.config.option.runner == "playwright":
+        pytest.xfail("Playwright doesn't support file system access APIs")
+
+    selenium = selenium_standalone
+
+    selenium.run_js(
+        """
+        root = await navigator.storage.getDirectory();
+        dirHandle = await root.getDirectoryHandle('test_opfs_read', { create: true });
+        testFileHandle = await dirHandle.getFileHandle('hello.txt', { create: true });
+        writable = await testFileHandle.createWritable();
+        await writable.write("hello from opfs");
+        await writable.close();
+        fs = await pyodide.mountOPFS("/mnt/opfs", dirHandle);
+        """
+    )
+
+    selenium.run(
+        """
+        import os
+        import pathlib
+        assert os.listdir("/mnt/opfs") == ["hello.txt"], str(os.listdir("/mnt/opfs"))
+        assert pathlib.Path("/mnt/opfs/hello.txt").read_text() == "hello from opfs"
+        """
+    )
+
+    selenium.run_js(
+        """
+        await fs.syncfs();
+        pyodide.FS.unmount("/mnt/opfs");
+        """
+    )
+
+
+@pytest.mark.requires_dynamic_linking
+@only_chrome
+def test_opfs_worker_write_existing(request, selenium_standalone):
+    """Mount, write to existing file from Python, verify content persists immediately"""
+    if request.config.option.runner == "playwright":
+        pytest.xfail("Playwright doesn't support file system access APIs")
+
+    selenium = selenium_standalone
+
+    selenium.run_js(
+        """
+        root = await navigator.storage.getDirectory();
+        dirHandle = await root.getDirectoryHandle('test_opfs_write', { create: true });
+        testFileHandle = await dirHandle.getFileHandle('data.txt', { create: true });
+        writable = await testFileHandle.createWritable();
+        await writable.write("original content");
+        await writable.close();
+        fs = await pyodide.mountOPFS("/mnt/opfs", dirHandle);
+        """
+    )
+
+    # Write to the existing file (goes through SyncAccessHandle directly)
+    selenium.run(
+        """
+        import pathlib
+        pathlib.Path("/mnt/opfs/data.txt").write_text("updated content")
+        assert pathlib.Path("/mnt/opfs/data.txt").read_text() == "updated content"
+        """
+    )
+
+    selenium.run_js(
+        """
+        await fs.syncfs();
+        pyodide.FS.unmount("/mnt/opfs");
+        """
+    )
+
+
+@pytest.mark.requires_dynamic_linking
+@only_chrome
+def test_opfs_worker_new_file(request, selenium_standalone):
+    """Create new file from Python, call syncfs(), verify in OPFS via JS"""
+    if request.config.option.runner == "playwright":
+        pytest.xfail("Playwright doesn't support file system access APIs")
+
+    selenium = selenium_standalone
+
+    selenium.run_js(
+        """
+        root = await navigator.storage.getDirectory();
+        dirHandle = await root.getDirectoryHandle('test_opfs_new', { create: true });
+        fs = await pyodide.mountOPFS("/mnt/opfs", dirHandle);
+        """
+    )
+
+    selenium.run(
+        """
+        import pathlib
+        pathlib.Path("/mnt/opfs/new_file.txt").write_text("brand new file")
+        """
+    )
+
+    entries = selenium.run_js(
+        """
+        await fs.syncfs();
+        entries = {};
+        for await (const [key, value] of dirHandle.entries()) {
+            entries[key] = value.kind;
+        }
+        return entries;
+        """
+    )
+
+    assert "new_file.txt" in entries
+
+    selenium.run_js(
+        """
+        pyodide.FS.unmount("/mnt/opfs");
+        """
+    )
+
+
+@pytest.mark.requires_dynamic_linking
+@only_chrome
+def test_opfs_worker_directory_ops(request, selenium_standalone):
+    """List dirs, create subdirs, verify structure"""
+    if request.config.option.runner == "playwright":
+        pytest.xfail("Playwright doesn't support file system access APIs")
+
+    selenium = selenium_standalone
+
+    selenium.run_js(
+        """
+        root = await navigator.storage.getDirectory();
+        dirHandle = await root.getDirectoryHandle('test_opfs_dirs', { create: true });
+        subDir = await dirHandle.getDirectoryHandle('subdir', { create: true });
+        fileHandle = await subDir.getFileHandle('nested.txt', { create: true });
+        writable = await fileHandle.createWritable();
+        await writable.write("nested content");
+        await writable.close();
+        fs = await pyodide.mountOPFS("/mnt/opfs", dirHandle);
+        """
+    )
+
+    selenium.run(
+        """
+        import os
+        import pathlib
+        assert "subdir" in os.listdir("/mnt/opfs")
+        assert "nested.txt" in os.listdir("/mnt/opfs/subdir")
+        assert pathlib.Path("/mnt/opfs/subdir/nested.txt").read_text() == "nested content"
+        """
+    )
+
+    # Create a new subdirectory from Python and syncfs
+    selenium.run(
+        """
+        import os
+        os.makedirs("/mnt/opfs/newsubdir", exist_ok=True)
+        pathlib.Path("/mnt/opfs/newsubdir/test.txt").write_text("test in subdir")
+        """
+    )
+
+    entries = selenium.run_js(
+        """
+        await fs.syncfs();
+        entries = {};
+        for await (const [key, value] of dirHandle.entries()) {
+            entries[key] = value.kind;
+        }
+        return entries;
+        """
+    )
+
+    assert "subdir" in entries
+    assert "newsubdir" in entries
+
+    selenium.run_js(
+        """
+        pyodide.FS.unmount("/mnt/opfs");
+        """
+    )
+
+
+@pytest.mark.requires_dynamic_linking
+@only_chrome
+def test_opfs_worker_large_file(request, selenium_standalone):
+    """Write/read a large file (~1MB), verify correct content"""
+    if request.config.option.runner == "playwright":
+        pytest.xfail("Playwright doesn't support file system access APIs")
+
+    selenium = selenium_standalone
+
+    selenium.run_js(
+        """
+        root = await navigator.storage.getDirectory();
+        dirHandle = await root.getDirectoryHandle('test_opfs_large', { create: true });
+        testFileHandle = await dirHandle.getFileHandle('large.bin', { create: true });
+
+        // Write 1MB of data
+        const data = new Uint8Array(1024 * 1024);
+        for (let i = 0; i < data.length; i++) {
+            data[i] = i & 0xff;
+        }
+        writable = await testFileHandle.createWritable();
+        await writable.write(data);
+        await writable.close();
+        fs = await pyodide.mountOPFS("/mnt/opfs", dirHandle);
+        """
+    )
+
+    selenium.run(
+        """
+        import os
+        import pathlib
+
+        data = pathlib.Path("/mnt/opfs/large.bin").read_bytes()
+        assert len(data) == 1024 * 1024
+        # Verify pattern
+        for i in range(0, len(data), 4096):
+            assert data[i] == i & 0xff, f"Mismatch at byte {i}: {data[i]} != {i & 0xff}"
+        """
+    )
+
+    selenium.run_js(
+        """
+        await fs.syncfs();
+        pyodide.FS.unmount("/mnt/opfs");
+        """
+    )
+
+
+@pytest.mark.requires_dynamic_linking
+@only_chrome
+def test_opfs_worker_unmount_remount(request, selenium_standalone):
+    """Write, unmount, remount, verify data persists"""
+    if request.config.option.runner == "playwright":
+        pytest.xfail("Playwright doesn't support file system access APIs")
+
+    selenium = selenium_standalone
+
+    selenium.run_js(
+        """
+        root = await navigator.storage.getDirectory();
+        dirHandle = await root.getDirectoryHandle('test_opfs_remount', { create: true });
+        testFileHandle = await dirHandle.getFileHandle('persist.txt', { create: true });
+        writable = await testFileHandle.createWritable();
+        await writable.write("persistent data");
+        await writable.close();
+        fs = await pyodide.mountOPFS("/mnt/opfs", dirHandle);
+        """
+    )
+
+    selenium.run(
+        """
+        import pathlib
+        assert pathlib.Path("/mnt/opfs/persist.txt").read_text() == "persistent data"
+        pathlib.Path("/mnt/opfs/persist.txt").write_text("modified data")
+        """
+    )
+
+    # Unmount
+    selenium.run_js(
+        """
+        await fs.syncfs();
+        pyodide.FS.unmount("/mnt/opfs");
+        """
+    )
+
+    # Verify empty after unmount
+    files = selenium.run(
+        """
+        import os
+        os.listdir("/mnt/opfs")
+        """
+    )
+    assert not len(files)
+
+    # Remount
+    selenium.run_js(
+        """
+        fs2 = await pyodide.mountOPFS("/mnt/opfs", dirHandle);
+        """
+    )
+
+    selenium.run(
+        """
+        import pathlib
+        assert pathlib.Path("/mnt/opfs/persist.txt").read_text() == "modified data"
+        """
+    )
+
+    selenium.run_js(
+        """
+        await fs2.syncfs();
+        pyodide.FS.unmount("/mnt/opfs");
+        """
+    )
+
+
+@pytest.mark.requires_dynamic_linking
+@only_chrome
+def test_opfs_worker_errors(request, selenium):
+    """Invalid handle, already mounted, non-empty dir"""
+    if request.config.option.runner == "playwright":
+        pytest.xfail("Playwright doesn't support file system access APIs")
+
+    selenium.run_js(
+        """
+        const root = await navigator.storage.getDirectory();
+        const handle = await root.getDirectoryHandle("opfs_err_dir", { create: true });
+
+        await pyodide.mountOPFS("/mnt1/opfs", handle);
+        await assertThrowsAsync(
+          async () => await pyodide.mountOPFS("/mnt1/opfs", handle),
+          "Error",
+          "path '/mnt1/opfs' is already a file system mount point",
+        );
+
+        pyodide.FS.mkdirTree("/mnt2");
+        pyodide.FS.writeFile("/mnt2/some_file", "contents");
+        await assertThrowsAsync(
+          async () => await pyodide.mountOPFS("/mnt2/some_file", handle),
+          "Error",
+          "path '/mnt2/some_file' points to a file not a directory",
+        );
+        // Check we didn't overwrite the file.
+        assert(
+          () =>
+            pyodide.FS.readFile("/mnt2/some_file", { encoding: "utf8" }) === "contents",
+        );
+
+        pyodide.FS.mkdirTree("/mnt3/opfs");
+        pyodide.FS.writeFile("/mnt3/opfs/a.txt", "contents");
+        await assertThrowsAsync(
+          async () => await pyodide.mountOPFS("/mnt3/opfs", handle),
+          "Error",
+          "directory '/mnt3/opfs' is not empty",
+        );
+        """
+    )
+
+
+@pytest.mark.requires_dynamic_linking
+@only_chrome
+def test_opfs_worker_truncate(request, selenium_standalone):
+    """Truncate file, verify size changes via both Python and JS"""
+    if request.config.option.runner == "playwright":
+        pytest.xfail("Playwright doesn't support file system access APIs")
+
+    selenium = selenium_standalone
+
+    selenium.run_js(
+        """
+        root = await navigator.storage.getDirectory();
+        dirHandle = await root.getDirectoryHandle('test_opfs_trunc', { create: true });
+        testFileHandle = await dirHandle.getFileHandle('trunc.txt', { create: true });
+        writable = await testFileHandle.createWritable();
+        await writable.write("hello world, this is a long string");
+        await writable.close();
+        fs = await pyodide.mountOPFS("/mnt/opfs", dirHandle);
+        """
+    )
+
+    selenium.run(
+        """
+        import os
+        import pathlib
+        p = pathlib.Path("/mnt/opfs/trunc.txt")
+        original = p.read_text()
+        assert len(original) == 34
+
+        # Truncate via Python
+        with open("/mnt/opfs/trunc.txt", "r+") as f:
+            f.truncate(5)
+
+        assert os.path.getsize("/mnt/opfs/trunc.txt") == 5
+        assert p.read_text() == "hello"
+        """
+    )
+
+    selenium.run_js(
+        """
+        await fs.syncfs();
+        pyodide.FS.unmount("/mnt/opfs");
+        """
+    )
+
+
 @only_chrome
 def test_nativefs_errors(selenium):
     selenium.run_js(
