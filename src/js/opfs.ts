@@ -15,11 +15,11 @@ export function initializeOPFS(module: PyodideModule) {
   const PATH = module.PATH;
 
   // Map: Emscripten node.id -> SyncAccessHandle (for file I/O)
-  const handleMap: Map<number, FileSystemSyncAccessHandle> = new Map();
+  const handleMap: Map<number, any> = new Map();
   // Map: Emscripten node.id -> FileSystemFileHandle (to reopen handles)
-  const fileHandleMap: Map<number, FileSystemFileHandle> = new Map();
+  const fileHandleMap: Map<number, any> = new Map();
   // Map: relative path -> FileSystemDirectoryHandle (for dir ops)
-  const dirHandleMap: Map<string, FileSystemDirectoryHandle> = new Map();
+  const dirHandleMap: Map<string, any> = new Map();
 
   /**
    * Override stream_ops on a node to use SyncAccessHandle for I/O.
@@ -181,12 +181,12 @@ export function initializeOPFS(module: PyodideModule) {
         }
 
         // Open SyncAccessHandle for direct I/O
-        const syncHandle: FileSystemSyncAccessHandle =
-          await (handle as FileSystemFileHandle).createSyncAccessHandle();
+        const syncHandle: any =
+          await (handle as any).createSyncAccessHandle();
 
         handleMap.set(node.id, syncHandle);
-        fileHandleMap.set(node.id, handle as FileSystemFileHandle);
-        node.usedBytes = syncHandle.getSize();
+        fileHandleMap.set(node.id, handle);
+        (node as any).usedBytes = syncHandle.getSize();
 
         // Override stream_ops on this node to use SyncAccessHandle
         applyHandleOps(node);
@@ -267,7 +267,7 @@ export function initializeOPFS(module: PyodideModule) {
             const fileHandle = await parentHandle.getFileHandle(fileName, {
               create: true,
             });
-            const syncHandle = await fileHandle.createSyncAccessHandle();
+            const syncHandle = await (fileHandle as any).createSyncAccessHandle();
 
             handleMap.set(node.id, syncHandle);
             fileHandleMap.set(node.id, fileHandle);
@@ -278,7 +278,7 @@ export function initializeOPFS(module: PyodideModule) {
               syncHandle.write(contents, { at: 0 });
               syncHandle.truncate(contents.length);
             }
-            node.usedBytes = contents.length;
+            (node as any).usedBytes = contents.length;
 
             // Override node ops to use SyncAccessHandle going forward
             applyHandleOps(node);
