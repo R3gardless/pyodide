@@ -1,11 +1,39 @@
 import { PyodideModule } from "./types";
 import { getFsHandles } from "./nativefs";
 
+// FileSystemSyncAccessHandle is only available in Web Worker contexts.
+// Declare the interface here to avoid adding WebWorker lib to tsconfig.
+interface FileSystemSyncAccessHandle {
+  close(): void;
+  flush(): void;
+  getSize(): number;
+  read(buffer: ArrayBufferView, options?: { at?: number }): number;
+  truncate(newSize: number): void;
+  write(buffer: ArrayBufferView, options?: { at?: number }): number;
+}
+
+// Extend FileSystemFileHandle with createSyncAccessHandle (WebWorker-only API)
+interface FileSystemFileHandleWithSync extends FileSystemFileHandle {
+  createSyncAccessHandle(): Promise<FileSystemSyncAccessHandle>;
+}
+
+/**
+ * Check if we're running in a dedicated worker where
+ * createSyncAccessHandle is available.
+ */
+function canUseSyncAccessHandle(): boolean {
+  return (
+    typeof globalThis.constructor !== "undefined" &&
+    globalThis.constructor.name === "DedicatedWorkerGlobalScope"
+  );
+}
+
 /**
  * Initialize the OPFS_WORKER filesystem and register it with Emscripten.
  *
- * OPFS_WORKER uses FileSystemSyncAccessHandle for direct synchronous I/O
- * against the Origin Private File System, bypassing MEMFS for file data.
+ * When running in a dedicated Web Worker, uses FileSystemSyncAccessHandle
+ * for direct synchronous I/O. When running in the main thread, falls back
+ * to async File API reads and MEMFS-backed writes with async sync to OPFS.
  *
  * @private
  */
@@ -14,15 +42,18 @@ export function initializeOPFS(module: PyodideModule) {
   const MEMFS = module.FS.filesystems.MEMFS;
   const PATH = module.PATH;
 
-  // Map: Emscripten node.id -> SyncAccessHandle (for file I/O)
-  const handleMap: Map<number, any> = new Map();
-  // Map: Emscripten node.id -> FileSystemFileHandle (to reopen handles)
-  const fileHandleMap: Map<number, any> = new Map();
+  const useSync = canUseSyncAccessHandle();
+
+  // Map: Emscripten node.id -> SyncAccessHandle (only used in worker mode)
+  const handleMap: Map<number, FileSystemSyncAccessHandle> = new Map();
+  // Map: Emscripten node.id -> FileSystemFileHandle
+  const fileHandleMap: Map<number, FileSystemFileHandle> = new Map();
   // Map: relative path -> FileSystemDirectoryHandle (for dir ops)
-  const dirHandleMap: Map<string, any> = new Map();
+  const dirHandleMap: Map<string, FileSystemDirectoryHandle> = new Map();
 
   /**
    * Override stream_ops on a node to use SyncAccessHandle for I/O.
+   * Only used in worker mode.
    */
   function applyHandleOps(node: any) {
     const origNodeOps = { ...node.node_ops };
@@ -53,7 +84,6 @@ export function initializeOPFS(module: PyodideModule) {
     node.stream_ops = {
       ...origStreamOps,
       open(stream: any) {
-        // Attach cached SyncAccessHandle
         const handle = handleMap.get(stream.node.id);
         if (handle) {
           stream.handle = handle;
@@ -68,7 +98,6 @@ export function initializeOPFS(module: PyodideModule) {
       ): number {
         const handle = stream.handle || handleMap.get(stream.node.id);
         if (!handle) {
-          // Fallback to MEMFS for un-synced files
           return origStreamOps.read(stream, buffer, offset, length, position);
         }
         if (length === 0) return 0;
@@ -86,7 +115,6 @@ export function initializeOPFS(module: PyodideModule) {
       ): number {
         const handle = stream.handle || handleMap.get(stream.node.id);
         if (!handle) {
-          // Fallback to MEMFS for un-synced files
           return origStreamOps.write(stream, buffer, offset, length, position);
         }
         if (length === 0) return 0;
@@ -101,10 +129,8 @@ export function initializeOPFS(module: PyodideModule) {
       llseek(stream: any, offset: number, whence: number): number {
         let position = offset;
         if (whence === 1) {
-          // SEEK_CUR
           position += stream.position;
         } else if (whence === 2) {
-          // SEEK_END
           const handle = stream.handle || handleMap.get(stream.node.id);
           if (handle) {
             position += handle.getSize();
@@ -122,7 +148,6 @@ export function initializeOPFS(module: PyodideModule) {
         if (handle) {
           handle.flush();
         }
-        // Keep handle open for reuse -- it will be closed on unmount
       },
       fsync(stream: any) {
         const handle = stream.handle || handleMap.get(stream.node.id);
@@ -135,7 +160,7 @@ export function initializeOPFS(module: PyodideModule) {
 
   /**
    * Walk the OPFS tree, create MEMFS directory/file nodes,
-   * and open SyncAccessHandles for each file.
+   * and either open SyncAccessHandles (worker) or load file data into MEMFS (main thread).
    */
   async function populateFromOPFS(mount: any) {
     const rootHandle: FileSystemDirectoryHandle =
@@ -144,7 +169,6 @@ export function initializeOPFS(module: PyodideModule) {
 
     dirHandleMap.set(".", rootHandle);
 
-    // Sort paths so parent directories come before children
     const sortedPaths = [...handles.keys()].sort();
 
     for (const relPath of sortedPaths) {
@@ -161,7 +185,6 @@ export function initializeOPFS(module: PyodideModule) {
           // directory may already exist
         }
       } else if (handle.kind === "file") {
-        // Create an empty MEMFS file node (no data stored in MEMFS)
         const parentDir = PATH.dirname(absPath);
         try {
           FS.mkdirTree(parentDir);
@@ -169,36 +192,48 @@ export function initializeOPFS(module: PyodideModule) {
           // parent may already exist
         }
 
-        // Create empty file if it doesn't exist
-        let node;
-        try {
-          const lookup = FS.lookupPath(absPath, {});
-          node = lookup.node;
-        } catch (_e) {
-          FS.writeFile(absPath, new Uint8Array(0));
-          const lookup = FS.lookupPath(absPath, {});
-          node = lookup.node;
+        const fileHandle = handle as FileSystemFileHandle;
+
+        if (useSync) {
+          // Worker mode: open SyncAccessHandle for direct I/O
+          let node;
+          try {
+            const lookup = FS.lookupPath(absPath, {});
+            node = lookup.node;
+          } catch (_e) {
+            FS.writeFile(absPath, new Uint8Array(0));
+            const lookup = FS.lookupPath(absPath, {});
+            node = lookup.node;
+          }
+
+          const syncHandle: FileSystemSyncAccessHandle =
+            await (fileHandle as FileSystemFileHandleWithSync).createSyncAccessHandle();
+
+          handleMap.set(node.id, syncHandle);
+          fileHandleMap.set(node.id, fileHandle);
+          (node as any).usedBytes = syncHandle.getSize();
+
+          applyHandleOps(node);
+        } else {
+          // Main thread: read file contents into MEMFS
+          const file = await fileHandle.getFile();
+          const contents = new Uint8Array(await file.arrayBuffer());
+          FS.writeFile(absPath, contents);
+          fileHandleMap.set(
+            FS.lookupPath(absPath, {}).node.id,
+            fileHandle,
+          );
         }
-
-        // Open SyncAccessHandle for direct I/O
-        const syncHandle: any =
-          await (handle as any).createSyncAccessHandle();
-
-        handleMap.set(node.id, syncHandle);
-        fileHandleMap.set(node.id, handle);
-        (node as any).usedBytes = syncHandle.getSize();
-
-        // Override stream_ops on this node to use SyncAccessHandle
-        applyHandleOps(node);
       }
     }
   }
 
   /**
    * Sync local changes to OPFS:
-   * - New MEMFS files without handles -> create in OPFS + open SyncAccessHandle
-   * - Deleted files -> close handle + removeEntry()
-   * - Flush all open handles
+   * - New MEMFS files without handles -> create in OPFS
+   * - Modified files -> write MEMFS contents to OPFS
+   * - Deleted files -> removeEntry()
+   * - In worker mode: flush all open SyncAccessHandles
    */
   async function pushToOPFS(mount: any) {
     const rootHandle: FileSystemDirectoryHandle =
@@ -237,7 +272,6 @@ export function initializeOPFS(module: PyodideModule) {
 
       if (FS.isDir(stat.mode)) {
         if (!dirHandleMap.has(relPath)) {
-          // Create directory in OPFS
           const parentRelPath = PATH.dirname(relPath);
           const dirName = PATH.basename(relPath);
           const parentHandle =
@@ -255,8 +289,9 @@ export function initializeOPFS(module: PyodideModule) {
       } else if (FS.isFile(stat.mode)) {
         const lookup = FS.lookupPath(absPath, {});
         const node = lookup.node;
-        if (!handleMap.has(node.id)) {
-          // New file: create in OPFS
+
+        if (useSync && !handleMap.has(node.id)) {
+          // Worker mode: new file, create in OPFS + open SyncAccessHandle
           const parentRelPath = PATH.dirname(relPath);
           const fileName = PATH.basename(relPath);
           const parentHandle =
@@ -267,12 +302,13 @@ export function initializeOPFS(module: PyodideModule) {
             const fileHandle = await parentHandle.getFileHandle(fileName, {
               create: true,
             });
-            const syncHandle = await (fileHandle as any).createSyncAccessHandle();
+            const syncHandle = await (
+              fileHandle as FileSystemFileHandleWithSync
+            ).createSyncAccessHandle();
 
             handleMap.set(node.id, syncHandle);
             fileHandleMap.set(node.id, fileHandle);
 
-            // Copy MEMFS contents to the new SyncAccessHandle
             const contents = MEMFS.getFileDataAsTypedArray(node);
             if (contents.length > 0) {
               syncHandle.write(contents, { at: 0 });
@@ -280,22 +316,42 @@ export function initializeOPFS(module: PyodideModule) {
             }
             (node as any).usedBytes = contents.length;
 
-            // Override node ops to use SyncAccessHandle going forward
             applyHandleOps(node);
+          }
+        } else if (!useSync) {
+          // Main thread: write MEMFS contents to OPFS via async API
+          const parentRelPath = PATH.dirname(relPath);
+          const fileName = PATH.basename(relPath);
+          const parentHandle =
+            parentRelPath === "."
+              ? rootHandle
+              : dirHandleMap.get(parentRelPath);
+          if (parentHandle) {
+            const fileHandle = await parentHandle.getFileHandle(fileName, {
+              create: true,
+            });
+            const writable = await fileHandle.createWritable();
+            const contents = FS.readFile(absPath) as Uint8Array;
+            await writable.write(contents as unknown as Blob);
+            await writable.close();
+            fileHandleMap.set(node.id, fileHandle);
           }
         }
       }
     }
 
-    // Find deleted files: handles exist but paths don't
+    // Find deleted files: handles exist in OPFS but paths don't exist locally
     const remoteHandles = await getFsHandles(rootHandle);
     for (const [relPath, handle] of remoteHandles) {
       if (relPath === ".") continue;
       if (!localPaths.has(relPath)) {
-        if (handle.kind === "file") {
-          // Find and close the SyncAccessHandle
+        if (handle.kind === "file" && useSync) {
+          // Close the SyncAccessHandle if in worker mode
           for (const [nodeId, fh] of fileHandleMap) {
-            if (fh === handle || fh.name === (handle as FileSystemFileHandle).name) {
+            if (
+              fh === handle ||
+              fh.name === (handle as FileSystemFileHandle).name
+            ) {
               const syncHandle = handleMap.get(nodeId);
               if (syncHandle) {
                 syncHandle.close();
@@ -324,9 +380,11 @@ export function initializeOPFS(module: PyodideModule) {
       }
     }
 
-    // Flush all open handles
-    for (const handle of handleMap.values()) {
-      handle.flush();
+    // Flush all open SyncAccessHandles (worker mode only)
+    if (useSync) {
+      for (const handle of handleMap.values()) {
+        handle.flush();
+      }
     }
   }
 
@@ -351,8 +409,8 @@ export function initializeOPFS(module: PyodideModule) {
       }
     },
 
-    unmount(mount: any) {
-      // Close all SyncAccessHandles
+    unmount(_mount: any) {
+      // Close all SyncAccessHandles (worker mode only)
       for (const handle of handleMap.values()) {
         try {
           handle.close();
