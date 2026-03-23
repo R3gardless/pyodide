@@ -579,10 +579,10 @@ export class PyodideAPI_ {
    * Mounts the Origin Private File System (OPFS) into the target directory.
    * Must be called from a Web Worker context, as FileSystemSyncAccessHandle
    * is only available in dedicated workers.
-   * 
+   *
    * @param path The absolute path in the Emscripten file system to mount OPFS.
    * If the directory does not exist, it will be created. If it does exist, it must be empty.
-  */
+   */
   static async mountOPFS(path: string): Promise<void> {
     if (!navigator?.storage?.getDirectory) {
       throw new Error("OPFS is not supported in this environment");
