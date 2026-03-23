@@ -102,7 +102,6 @@ export function initializeOPFS(module: PyodideModule) {
     }
 
     module.FS.filesystems.OPFS_WORKER_FS = opfsWorkerFS;
-
-    return { loadOPFS }
+    module.API.loadOPFS = loadOPFS;
 }
 
