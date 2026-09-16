@@ -15,6 +15,13 @@ myst:
 
 # Change Log
 
+## Unreleased
+
+- {{ Feature }} Added {js:func}`pyodide.mountOPFS`, which mounts the Origin
+  Private File System (OPFS) into the Pyodide file system. It is backed by
+  `FileSystemSyncAccessHandle`, so file access is synchronous, but for the same
+  reason it only works in a dedicated Web Worker. {pr}`6149`
+
 ## Version 314.0.7
 
 _September 14, 2026_
